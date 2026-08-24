@@ -1,0 +1,19 @@
+# Nim build artifacts
+nimcache/
+nimblecache/
+htmldocs/
+
+# Compiled binaries
+/CatelliteCompressor
+/create_test_dir
+*.exe
+*.out
+
+# Generated archives (produced by the tool)
+*.catcomp
+
+# Test fixtures and restored outputs
+test_dir/
+restored*/
+restored_*/
+/src/create_test_dir
