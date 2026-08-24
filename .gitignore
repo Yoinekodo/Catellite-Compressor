@@ -11,9 +11,13 @@ htmldocs/
 
 # Generated archives (produced by the tool)
 *.catcomp
+*.catcmp
+*.deb
 
 # Test fixtures and restored outputs
 test_dir/
 restored*/
 restored_*/
 /src/create_test_dir
+*.safetensors
+/catcmp
