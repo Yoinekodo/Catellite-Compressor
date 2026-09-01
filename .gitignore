@@ -21,3 +21,6 @@ restored_*/
 /src/create_test_dir
 *.safetensors
 /catcmp
+/CC
+/run.py
+/src/CatelliteCompressor
