@@ -983,7 +983,7 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
         reps[i] = reps[i-1]
       reps[0] = tmp
     elif which == 4:
-      reps[3] = reps[2]; reps[2] = reps[1]; reps[1] = reps[0]; reps[0] = off
+      reps[3] = reps[2]; reps[2] = reps[1]; reps[1] = reps[0]; reps[0] = int(off)
     prevMatchLen = l
     dbgTagId = tagSave
 
