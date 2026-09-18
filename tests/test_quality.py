@@ -273,7 +273,11 @@ class TestTensorQuality(QualityBase):
 
         time.monotonic + resource.RUSAGE_CHILDREN.ru_maxrss を使用
         （/usr/bin/time 不要、外部ベンチデータ不要、決定論的）。
+        Windows では resource モジュールが無いためスキップ。
         """
+        import sys
+        if sys.platform == "win32":
+            self.skipTest("resource module not available on Windows")
         import time
         import resource
         src = self._make()
