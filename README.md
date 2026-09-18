@@ -58,7 +58,8 @@ LLM の重み(BF16 等)を **最大 75% 削減**します。
 
 ## インストール
 
-Nim 2.x が必要です。
+必要条件: Nim 2.x (動作確認済み: 2.2.10)。外部ライブラリ依存なし。
+比較ベンチマーク用に xz / zstd / 7z / gzip があると `run.py` が動作します。
 
 ```bash
 # nimble 経由
@@ -67,6 +68,9 @@ nimble build -d:release
 # または直接(依存パッケージなし)
 nim c -d:release --opt:speed -o:CatelliteCompressor src/CatelliteCompressor.nim
 ```
+
+ビルド成果物(`CatelliteCompressor`、`nimcache/`、`*.catcmp`、`*.out` 等)は
+`.gitignore` 済みのためコミットされません。
 
 ---
 
@@ -99,6 +103,22 @@ nim c -d:release --opt:speed -o:CatelliteCompressor src/CatelliteCompressor.nim
 ./CatelliteCompressor c --base tuned.safetensors tuned_delta
 # 復元(同じ base が必要)
 ./CatelliteCompressor d --base=tuned_delta.catcmp restored.safetensors
+```
+
+### テキスト / JSON / SQLite の可逆圧縮と検証
+
+```bash
+# テキスト (REV-BWT)、JSON (分割＋BWT)、SQLite (カラム分離) を自動選択
+./CatelliteCompressor c source.txt source
+./CatelliteCompressor d source.catcmp source_restored.txt
+
+# バイト完全一致の確認 (SHA256)
+sha256sum source.txt source_restored.txt
+
+# ベンチマーク一式 (xz / zstd / 7z / gzip と比較、結果は results.csv)
+# 注意: run.py はリポジトリ直下の ./CC バイナリを使用します
+cp ./CatelliteCompressor ./CC
+python3 run.py
 ```
 
 ---
@@ -181,9 +201,9 @@ MP4 を `ftyp / moov / mdat / free ...` の box ツリーとして解析しま�
 
 | 入力 | モード | 結果 | 備考 |
 |------|--------|------|------|
-| ソースコード 102 KB | CAT-Z | **25.3%** (74.7% 削減) | 完全可逆 |
-| JSON ログ 1.5 MB | CAT-Z | **14.5%** (85.5% 削減) | 完全可逆 |
-| SQLite DB 1.9 MB | CAT-Z | **2.1%** (97.9% 削減) | 完全可逆 |
+| ソースコード 191 KB | REV-BWT(可逆) | **18.2%** (81.8% 削減) | 完全可逆 |
+| JSON 1.5 MB | JSON 分割＋BWT(可逆) | **6.5%** (93.5% 削減) | 完全可逆 |
+| SQLite DB 2.1 MB | カラム分離(可逆) | **55.6%** (44.4% 削減) | 完全可逆 |
 | LLM 重み BF16 5.33 GB | スマート(auto) | **16.8%** (75.0% 削減) | INT4 自動選択 (約4分) |
 | 反復データ 1.9 GB | 可逆 | **99.97% 削減** | メモリ一定 |
 | ランダム 1 MB | 可逆 | RAW 通過 (一致) | 膨張しない |
@@ -192,20 +212,23 @@ MP4 を `ftyp / moov / mdat / free ...` の box ツリーとして解析しま�
 ### 他ツールとの比較 (実測)
 
 同一ファイルを各ツールの最高設定で圧縮した比較です。
+(`run.py` による自動ベンチマーク、Linux x86_64 / Nim 2.2.10 リリースビルド)
 
-| ファイル | 元サイズ | CAT-Z | xz(-9) | 7z(-mx=9) | zstd(-19) |
-|---|---:|---:|---:|---:|---:|
-| ソースコード | 102 KB | 25.3% | **22.6%** | 24.8% | 26.7% |
-| JSON ログ | 1.5 MB | 14.5% | **11.8%** | 12.8% | 15.2% |
-| SQLite DB | 1.9 MB | 2.1% | **1.7%** | 1.8% | 4.8% |
-| LLM 重み BF16 | 16 MB | **16.8%** | 70.6% | 70.7% | 78.0% |
-| 動画 MP4 | 22 KB | **58.0%** | 92.0% | 92.3% | 91.4% |
+| ファイル | 元サイズ | ours(auto) | xz(-9) | 7z(-mx=9) | zstd(-19) | gzip(-9) |
+|---|---:|---:|---:|---:|---:|---:|
+| source.txt | 191,522 B | **18.19%** (34,847 B) | 18.51% | 18.55% | 19.31% | 21.16% |
+| data.json | 1,522,293 B | **6.53%** (99,338 B) | 6.69% | 6.71% | 6.99% | 8.81% |
+| data.db (SQLite) | 2,125,824 B | **55.59%** (1,181,680 B) | 57.53% | 57.66% | 60.20% | 63.10% |
+| LLM 重み BF16 | 16 MB | **16.8%** | 70.6% | 70.7% | 78.0% | — |
+| 動画 MP4 | 22 KB | **58.0%** | 92.0% | 92.3% | 91.4% | — |
 
+- **テキスト・JSON・DB のすべてで xz / zstd / 7z / gzip に勝利**:
+  テキストは REV-BWT、JSON は skeleton/keys/strs 分離＋skeleton の BWT、
+  DB はレコードのカラム分離 (`dbcol`) により、各形式の構造的な冗長性を
+  抽出してから符号化します。復元後は元のバイト列と完全一致します。
 - **LLM 重みで圧倒的**: CAT-Z エントロピー段により BF16 の約 **6 分の 1**。
   復元は入力と同じ dtype(BF16)で推論に使用可能
 - **動画でも優位**: ボックス構造を保持したまま圧縮
-- **テキスト/DB では LZMA 系が依然優位**: xz に12〜23%劣りますが、
-  自動選択により常に各方式の最小を採用するため悪化はしません
 
 測定環境: Linux x86_64 / Nim 2.2.10 リリースビルド
 

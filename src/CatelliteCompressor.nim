@@ -202,6 +202,29 @@ proc bwtDecode(bwt: string, primary: int): string =
   else:
     result = tmp
 
+# ---- SQLite 可逆変換用の共有ヘルパー ----
+# SQLite varint (big-endian base-128) のデコード。範囲外参照時は ok=false。
+proc sqliteVarint(b: string, o: int, lim: int): tuple[v: int, l: int, ok: bool] =
+  var v = 0
+  for i in 0..<9:
+    if o + i >= lim: return (0, 0, false)
+    let c = int(uint8(b[o+i]))
+    if i == 8:
+      v = (v shl 8) or c
+      return (v, i+1, true)
+    v = (v shl 7) or (c and 0x7F)
+    if (c and 0x80) == 0: return (v, i+1, true)
+  return (v, 9, true)
+
+# SQLite シリアルタイプ -> 値バイト長。不正値は -1。
+proc sqliteSerLen(st: int): int =
+  if st == 0 or st == 8 or st == 9: return 0
+  if st >= 1 and st <= 6: return st
+  if st == 7: return 8
+  if st >= 12 and (st mod 2) == 0: return (st-12) div 2
+  if st >= 13: return (st-13) div 2
+  return -1
+
 proc vmEncode(src, dst: Stream, inputLimit: uint64): uint64 =
   var head: array[HashSize, int64]
   for i in 0..<HashSize: head[i] = -1
@@ -898,12 +921,6 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
         result += gCost(probs[base + m], sb)
         m = (m shl 1) + sb
 
-    # LZMA-style lazy matching state
-    var lazyL = 0
-    var lazyOff = 0
-    var lazyPos = 0
-    var haveLazy = false
-
     while true:
       if not eof: refill()
       let margin = if eof: 0 else: ZMaxOff
@@ -988,10 +1005,6 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
         if cpRel < 0 or cpRel >= buf.len: break
         let maxLen = min(limit - gi, buf.len - cpRel)
         var l = 0
-        # Fast match length check: compare 4 bytes at a time for speed
-        while l + 3 < maxLen and
-              uint32(buf[cpRel + l]) == uint32(buf[gi + l]):
-          inc l, 4
         while l < maxLen and buf[cpRel + l] == buf[gi + l]:
           inc l
         updateBest(l, off)
@@ -1020,9 +1033,6 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
         if cpRel < 0 or cpRel >= buf.len: break
         let maxLen = min(limit - gi, buf.len - cpRel)
         var l = 0
-        while l + 3 < maxLen and
-              uint32(buf[cpRel + l]) == uint32(buf[gi + l]):
-          inc l, 4
         while l < maxLen and buf[cpRel + l] == buf[gi + l]:
           inc l
         updateBest(l, off)
@@ -1044,15 +1054,6 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
             inc l
           if l >= MinMatchZ:
             updateBest(l, off)
-
-      # Lazy matching: if we have a pending lazy match, evaluate it
-      if haveLazy and gi == lazyPos:
-        # Compare lazy match with current best
-        if bestL < lazyL or (bestL == lazyL and bestOff > lazyOff):
-          # Use lazy match
-          bestL = lazyL
-          bestOff = lazyOff
-        haveLazy = false
 
       var litCost = gCost(flagP[pos * 12 + state], 0)
       block:
@@ -1130,47 +1131,14 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
       if bestL < secL:
         priceMatch(secL, secOff)
 
-      # Lazy match decision: if current match is good but next position might be better
-      if bestL >= MinMatchZ and bestL < FastBytes and gi + 1 < limit:
-        # Save current match as lazy candidate
-        lazyL = bestL
-        lazyOff = bestOff
-        lazyPos = gi + 1
-        haveLazy = true
-        # Emit literal for current position, continue to next
-        encFlag(false, pos)
-        let litCtx = if useLzmaLitCtx:
-          (prevLit shr (8 - Z_LC)) * ZPosStates + pos
-        else:
-          min(state, 7) * 256 + prevLit
-        let mctx = prevLit
-        let symE = int(uint8(buf[gi]))
-        if reps[0] > 0 and gi >= reps[0]:
-          let mbv = int(uint8(buf[gi - reps[0]]))
-          var m2 = 1
-          var mb = mbv
-          for k in countdown(7, 0):
-            let mbit = (mb shr k) and 1
-            let sbit = (symE shr k) and 1
-            e.rcEncBit(litM[mctx * 512 + (m2 shl 1) + mbit], sbit)
-            m2 = (m2 shl 1) + sbit
-        else:
-          e.rcTreeEnc(litU, litCtx * 256, 8, symE)
-        state = if state < 7: 0 else: state - 6
-        prevPrevLit = prevLit
-        prevLit = symE
-        prevMatchLen = 0
-        inc idx
-        continue
-
       if useMatch:
-        encFlag(true, pos)
-        emitMatch(matchOff, matchL, pos)
         var which = 4
         if matchOff == reps[0]: which = 0
         elif matchOff == reps[1]: which = 1
         elif matchOff == reps[2]: which = 2
         elif matchOff == reps[3]: which = 3
+        encFlag(true, pos)
+        emitMatch(matchOff, matchL, pos)
         if which < 4:
           state = min(state + 1, 11)
         else:
@@ -1316,10 +1284,6 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
             if cpRel < 0 or cpRel >= buf.len: break
             let maxLen = min(limit - gi, buf.len - cpRel)
             var l = 0
-            # 4-byte compare for speed
-            while l + 3 < maxLen and
-                  uint32(buf[cpRel + l]) == uint32(buf[gi + l]):
-              inc l, 4
             while l < maxLen and buf[cpRel + l] == buf[gi + l]:
               inc l
             updTop4(l, off)
@@ -1346,9 +1310,6 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
             if cpRel < 0 or cpRel >= buf.len: break
             let maxLen = min(limit - gi, buf.len - cpRel)
             var l = 0
-            while l + 3 < maxLen and
-                  uint32(buf[cpRel + l]) == uint32(buf[gi + l]):
-              inc l, 4
             while l < maxLen and buf[cpRel + l] == buf[gi + l]:
               inc l
             updTop4(l, off)
@@ -3162,7 +3123,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
           outp.wU64le(uint64(origF))
           let compPos = outp.getPosition(); outp.wU64le(0)
           let payStart = outp.getPosition()
-          let extS = "txt"
+          let extS = "bwt"
           outp.write uint8(extS.len); outp.write extS
           outp.write useMth
           outp.wU64le(uint64(innerB.len))
@@ -3207,7 +3168,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
           outp.wU64le(uint64(origF))
           let compPos = outp.getPosition(); outp.wU64le(0)
           let payStart = outp.getPosition()
-          let extS = "json"
+          let extS = "bwt"
           outp.write uint8(extS.len); outp.write extS
           outp.write useMth
           outp.wU64le(uint64(innerB.len))
@@ -3224,6 +3185,272 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
           totOrig += uint64(origF)
           totComp += compL + uint64(22 + relPath.len)
           return
+
+  # --- SQLite DB カラム分離圧縮(完全可逆・高圧縮) ---
+  # レコードをパースしてカラム毎に分離し、各カラムを個別圧縮する。
+  # 失敗時や効果薄時はフォールバック（後続のREV-DBへ）。
+  if origF >= 1024 and origF <= 4 * 1024 * 1024:
+    block tryDbColumnar:
+      var fC = openFileStream(srcPath, fmRead)
+      var header = newString(100)
+      let gotH = fC.readData(addr header[0], 100)
+      if gotH != 100 or header[0..15] != "SQLite format 3\x00":
+        fC.close()
+        break tryDbColumnar
+      let pageSize = int(uint8(header[16])) * 256 + int(uint8(header[17]))
+      if pageSize < 512 or pageSize > 65536:
+        fC.close()
+        break tryDbColumnar
+      fC.setPosition(0)
+      var dbData = newString(int(origF))
+      let gotD = fC.readData(addr dbData[0], int(origF))
+      fC.close()
+      if gotD != int(origF):
+        break tryDbColumnar
+      let pageCount = (int(origF) + pageSize - 1) div pageSize
+      var metaBuf = newStringStream("")
+      var gapBuf = newStringStream("")
+      var rowidBuf = newStringStream("")
+      var rhdrBuf = newStringStream("")
+      var colBufs = [newStringStream(""), newStringStream(""), newStringStream(""),
+                     newStringStream(""), newStringStream("")]
+      var maxCols = 0
+      var totalRecs = 0
+      var okParse = true
+      for i in 0..<pageCount:
+        let start = i * pageSize
+        let endPos = min(start + pageSize, int(origF))
+        if endPos - start < 8:
+          okParse = false; break
+        let base = if i == 0: 100 else: 0
+        let pgLen = endPos - (start + base)
+        if pgLen < 8:
+          okParse = false; break
+        let ptype = int(uint8(dbData[start+base]))
+        if ptype != 5 and ptype != 13:
+          okParse = false; break
+        let hdrLen = if ptype == 5: 12 else: 8
+        if pgLen < hdrLen:
+          okParse = false; break
+        let ncells = int(uint8(dbData[start+base+3])) * 256 + int(uint8(dbData[start+base+4]))
+        let cs = int(uint8(dbData[start+base+5])) * 256 + int(uint8(dbData[start+base+6]))
+        if cs < hdrLen + 2*ncells or cs > pgLen:
+          okParse = false; break
+        let prefixEnd = start + base + hdrLen + 2*ncells
+        if prefixEnd > endPos:
+          okParse = false; break
+        if i == 0:
+          metaBuf.write(dbData[start..<start+100])
+          metaBuf.write(dbData[start+100..<prefixEnd])
+        else:
+          metaBuf.write(dbData[start..<prefixEnd])
+        type CellInfo = tuple[cellOff: int, reclen: int, rowid: string, rhdr: string, cols: array[5, string], ncol: int]
+        var cells: seq[CellInfo] = @[]
+        var pageRaw = false
+        if ptype != 13:
+          pageRaw = true
+        else:
+          # check for overflow records first; if any, store whole content as gap
+          for c in 0..<ncells:
+            let cptr = int(uint8(dbData[start+base+hdrLen+2*c])) * 256 + int(uint8(dbData[start+base+hdrLen+2*c+1]))
+            if cptr < cs or cptr >= pgLen:
+              okParse = false; break
+            let b = start + base + cptr
+            let (psz, l1, ok1) = sqliteVarint(dbData, b, start+base+pgLen)
+            if not ok1:
+              okParse = false; break
+            # record must fit fully in-page (no overflow support in columnar)
+            if l1 + psz > pgLen - cptr:
+              pageRaw = true
+              break
+          if not okParse: break
+        if pageRaw:
+          # store content area raw in gap stream; mark via meta flag
+          metaBuf.write(char(1))
+          if prefixEnd < endPos:
+            gapBuf.write(dbData[prefixEnd..<endPos])
+        else:
+          metaBuf.write(char(0))
+          for c in 0..<ncells:
+            let cptr = int(uint8(dbData[start+base+hdrLen+2*c])) * 256 + int(uint8(dbData[start+base+hdrLen+2*c+1]))
+            if cptr < cs or cptr >= pgLen:
+              okParse = false; break
+            let b = start + base + cptr
+            let (psz, l1, ok1) = sqliteVarint(dbData, b, start+base+pgLen)
+            if not ok1:
+              okParse = false; break
+            let (rid, l2, ok2) = sqliteVarint(dbData, b+l1, start+base+pgLen)
+            if not ok2:
+              okParse = false; break
+            let (rhl, l3, ok3) = sqliteVarint(dbData, b+l1+l2, start+base+pgLen)
+            if not ok3:
+              okParse = false; break
+            let p = b+l1+l2
+            let e = p+rhl
+            if e > start+base+pgLen or rhl < l3:
+              okParse = false; break
+            var colvals: array[5, string]
+            var ncol = 0
+            var q = p+l3
+            var v = e
+            var cok = true
+            var dbgSerials = 0
+            while q < e:
+              let (st, l, okk) = sqliteVarint(dbData, q, start+base+pgLen)
+              if not okk:
+                cok = false; break
+              let ln = sqliteSerLen(st)
+              if ln < 0 or v+ln > start+base+pgLen:
+                cok = false; break
+              if ncol >= 5:
+                cok = false; break
+              colvals[ncol] = dbData[v..<v+ln]
+              inc ncol
+              v += ln; q += l
+              inc dbgSerials
+              if dbgSerials > 20:
+                cok = false; break
+            if not cok:
+              okParse = false; break
+            let reclen = v - b
+            if b + reclen > start+base+pgLen:
+              okParse = false; break
+            cells.add((cptr, reclen, dbData[b..<b+l1+l2], dbData[p..<e], colvals, ncol))
+            if ncol > maxCols: maxCols = ncol
+          if not okParse: break
+          for ce in cells:
+            rowidBuf.write(ce.rowid)
+            rhdrBuf.write(ce.rhdr)
+            for j in 0..<ce.ncol:
+              colBufs[j].write(ce.cols[j])
+            inc totalRecs
+          var intervals: seq[tuple[s, e: int]] = @[]
+          for ce in cells:
+            intervals.add((ce.cellOff, ce.cellOff + ce.reclen))
+          intervals.sort(proc(a, b: tuple[s, e: int]): int = cmp(a.s, b.s))
+          var gpos = cs
+          for iv in intervals:
+            if iv.s < gpos or iv.e > pgLen:
+              okParse = false; break
+            if iv.s > gpos:
+              gapBuf.write(dbData[start+base+gpos..<start+base+iv.s])
+            gpos = max(gpos, iv.e)
+          if not okParse: break
+          if gpos < pgLen:
+            gapBuf.write(dbData[start+base+gpos..<start+base+pgLen])
+      if not okParse or totalRecs == 0:
+        break tryDbColumnar
+      if maxCols > 5:
+        break tryDbColumnar
+      metaBuf.setPosition(0); rowidBuf.setPosition(0); rhdrBuf.setPosition(0); gapBuf.setPosition(0)
+      let metaOrig = metaBuf.readAll(); rowidBuf.setPosition(0)
+      let rowOrig = rowidBuf.readAll(); rhdrBuf.setPosition(0)
+      let rhOrig = rhdrBuf.readAll(); gapBuf.setPosition(0)
+      let gapOrig = gapBuf.readAll()
+      var colOrigs: array[5, string]
+      for j in 0..<5:
+        colBufs[j].setPosition(0)
+        colOrigs[j] = colBufs[j].readAll()
+      proc compCatZ(data: string, pm, pb, ob: int): string =
+        if data.len == 0: return ""
+        var ms = newStringStream(data)
+        var tmp = newStringStream("")
+        tmp.write uint8(pm or (pb shl 4))
+        discard catZEncodeCore(ms, tmp, uint64(data.len), pm, pb, ob, true, false, 256)
+        tmp.setPosition(0)
+        return tmp.readAll()
+      proc compLz(data: string): string =
+        if data.len == 0: return ""
+        var ms = newStringStream(data)
+        var tmp = newStringStream("")
+        discard lzEncode(ms, tmp, uint64(data.len))
+        tmp.setPosition(0)
+        return tmp.readAll()
+      let zMeta = compCatZ(metaOrig, 4, 15, 8192)
+      let zRow = compCatZ(rowOrig, 4, 15, 8192)
+      let zRh = compCatZ(rhOrig, 4, 15, 65536)
+      var zCols: array[5, string]
+      for j in 0..<5:
+        if colOrigs[j].len == 0:
+          zCols[j] = ""
+        elif colOrigs[j].len < 4096:
+          zCols[j] = compLz(colOrigs[j])
+        else:
+          zCols[j] = compCatZ(colOrigs[j], 4, 15, 262144)
+      let zGap = compLz(gapOrig)
+      # verify roundtrips before committing
+      proc verifyCatZ(z: string, orig: string): bool =
+        if orig.len == 0: return z.len == 0
+        if z.len == 0: return false
+        var ds = newStringStream(z)
+        var oo = newStringStream("")
+        try:
+          catZDecode(ds, oo, uint64(orig.len))
+        except CatchableError:
+          return false
+        oo.setPosition(0)
+        return oo.readAll() == orig
+      if not verifyCatZ(zMeta, metaOrig): break tryDbColumnar
+      if not verifyCatZ(zRow, rowOrig): break tryDbColumnar
+      if not verifyCatZ(zRh, rhOrig): break tryDbColumnar
+      for j in 0..<5:
+        if colOrigs[j].len == 0: continue
+        if colOrigs[j].len < 4096:
+          var ds = newStringStream(zCols[j]); var oo = newStringStream("")
+          try: lzDecode(ds, oo, uint64(colOrigs[j].len))
+          except CatchableError: break tryDbColumnar
+          oo.setPosition(0)
+          if oo.readAll() != colOrigs[j]: break tryDbColumnar
+        else:
+          if not verifyCatZ(zCols[j], colOrigs[j]): break tryDbColumnar
+      block gapVerify:
+        var ds = newStringStream(zGap); var oo = newStringStream("")
+        try: lzDecode(ds, oo, uint64(gapOrig.len))
+        except CatchableError: break tryDbColumnar
+        oo.setPosition(0)
+        if oo.readAll() != gapOrig: break tryDbColumnar
+      var totalComp = zMeta.len + zRow.len + zRh.len + zGap.len + 200
+      for j in 0..<5: totalComp += zCols[j].len
+      if totalComp + 100 >= int(origF):
+        break tryDbColumnar
+      outp.write kind
+      outp.write uint8(relPath.len); outp.write relPath
+      outp.write MethodLossy
+      outp.wU64le(uint64(origF))
+      let compPos = outp.getPosition(); outp.wU64le(0)
+      let payStart = outp.getPosition()
+      let extS = "dbcol"
+      outp.write uint8(extS.len); outp.write extS
+      outp.write MethodCatZ
+      outp.wU64le(uint64(totalComp))
+      outp.wU64le(uint64(pageSize))
+      outp.wU64le(uint64(pageCount))
+      outp.wU64le(uint64(maxCols))
+      outp.wU64le(uint64(totalRecs))
+      proc writePart(mth: uint8, origLen: int, z: string) =
+        outp.write mth
+        outp.wU64le(uint64(origLen))
+        outp.wU64le(uint64(z.len))
+        outp.wU64le(uint64(origLen))
+        outp.write z
+      writePart(MethodCatZ, metaOrig.len, zMeta)
+      writePart(MethodCatZ, rowOrig.len, zRow)
+      writePart(MethodCatZ, rhOrig.len, zRh)
+      for j in 0..<5:
+        if colOrigs[j].len < 4096:
+          writePart(MethodCatLz, colOrigs[j].len, zCols[j])
+        else:
+          writePart(MethodCatZ, colOrigs[j].len, zCols[j])
+      writePart(MethodCatLz, gapOrig.len, zGap)
+      let aft = outp.getPosition()
+      let compL = uint64(aft - payStart)
+      outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft)
+      inc revCount
+      let pct = 100.0 - float(compL) / float(origF) * 100.0
+      echo "追加: ", dispName, " [REV-DBCU(可逆)] ", origF, " → ", compL, " bytes (", pct.formatFloat(ffDecimal, 1), "%削減)"
+      totOrig += uint64(origF)
+      totComp += compL + uint64(22 + relPath.len)
+      return
 
   # --- SQLite DB 構造可視化圧縮(完全可逆) ---
   if origF >= 1024 and origF <= 4 * 1024 * 1024:
@@ -3253,16 +3480,16 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
             msH.setPosition(0)
             var tmpOutH = newStringStream()
             tmpOutH.write uint8(4 or (15 shl 4))
-            discard catZEncodeCore(msH, tmpOutH, uint64(msH.data.len), 4, 15, 8192, false, false, 256)
+            discard catZEncodeCore(msH, tmpOutH, uint64(msH.data.len), 4, 15, 8192, false, true, 64)
             tmpOutH.setPosition(0)
             let zdataH = tmpOutH.readAll()
             var msP = newStringStream()
             for i in 0..<pageCount: msP.write(pagePayloads[i])
             msP.setPosition(0)
             var tmpOutP = newStringStream()
-            tmpOutP.write uint8(4 or (15 shl 4))
-            # DBペイロード: 貪欲モードでOptBlock=256KB、深い探索
-            discard catZEncodeCore(msP, tmpOutP, uint64(msP.data.len), 4, 15, 262144, false, true, 2048)
+            tmpOutP.write uint8(6 or (15 shl 4))
+            # DBペイロード: 価格付きモードでOptBlock=8KB
+            discard catZEncodeCore(msP, tmpOutP, uint64(msP.data.len), 6, 15, 8192, true, false, 256)
             tmpOutP.setPosition(0)
             let zdataP = tmpOutP.readAll()
             if zdataH.len + zdataP.len + 100 < int(origF):
@@ -3466,39 +3693,43 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
           bestSize = s; bestMth = MethodCatZ
         ft.close()
 
-# JSON専用: 大きなファイル向けにskeleton/keys/strs分離 + 個別圧縮
+# JSON専用: 大きなファイル向けにskeleton/keys/strs分離 + BWT + 個別圧縮
       if srcPath.toLowerAscii.endsWith(".json") and origF > 1024 * 1024:
         block tryJsonSplit:
           var skel, keys, strs: string
           if jsonSplit(srcPath, skel, keys, strs):
-            var msS = newStringStream(skel)
+            # BWT変換はNUL無しのskeletonのみ（stringsはu32le長 prefixにNULを含むためBWT不可）
+            let (skelBwtRaw, skelPrim) = bwtEncode(skel)
+            var skelBwt = newString(4 + skelBwtRaw.len)
+            skelBwt[0] = char(skelPrim and 0xFF); skelBwt[1] = char((skelPrim shr 8) and 0xFF)
+            skelBwt[2] = char((skelPrim shr 16) and 0xFF); skelBwt[3] = char((skelPrim shr 24) and 0xFF)
+            skelBwt[4..<skelBwt.len] = skelBwtRaw
+            var msS = newStringStream(skelBwt)
             var msK = newStringStream(keys)
             var msT = newStringStream(strs)
             var tmpOutS = newStringStream("")
             var tmpOutK = newStringStream("")
             var tmpOutT = newStringStream("")
-            # Skeleton: catZEncodeCore greedy with large OptBlock, deep search
-            tmpOutS.write uint8(4 or (15 shl 4))
-            discard catZEncodeCore(msS, tmpOutS, uint64(skel.len), 4, 15, 262144, false, true, 2048)
+            # Skeleton(BWT済): adaptive CAT-Z
+            discard catZEncode(msS, tmpOutS, uint64(skelBwt.len))
             # Keys: lzEncode (very fast, good for repetitive data)
             discard lzEncode(msK, tmpOutK, uint64(keys.len))
-            # Strings: catZEncodeCore greedy with large OptBlock, deep search
-            tmpOutT.write uint8(4 or (13 shl 4))
-            discard catZEncodeCore(msT, tmpOutT, uint64(strs.len), 4, 13, 262144, false, true, 2048)
+            # Strings(生): priced CAT-Z OptBlock=8K
+            tmpOutT.write uint8(4 or (15 shl 4))
+            discard catZEncodeCore(msT, tmpOutT, uint64(strs.len), 4, 15, 8192, true, false, 256)
             tmpOutS.setPosition(0); tmpOutK.setPosition(0); tmpOutT.setPosition(0)
             let zS = tmpOutS.readAll()
             let zK = tmpOutK.readAll()
             let zT = tmpOutT.readAll()
             let totalComp = zS.len + zK.len + zT.len + 20
-            stderr.writeLine("JSON split sizes: skel=", skel.len, " keys=", keys.len, " strs=", strs.len, " compS=", zS.len, " compK=", zK.len, " compT=", zT.len, " total=", totalComp)
             if totalComp < bestSize:
               bestSize = totalComp
               bestMth = MethodJson
-              # Store compressed parts for later use
+              # Store compressed parts for later use (orig caches hold BWT lengths)
               skelJsonCache = zS
               keysJsonCache = zK
               strsJsonCache = zT
-              skelOrigCache = uint64(skel.len)
+              skelOrigCache = uint64(skelBwt.len)
               keysOrigCache = uint64(keys.len)
               strsOrigCache = uint64(strs.len)
 
@@ -3715,6 +3946,149 @@ proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
       f.close()
       echo "復元成功: ", finalTarget, " [REV-DB(可逆)]"
       return
+    elif ext == "dbcol":
+      let pageSize = int(inp.rU64le())
+      let pageCount = int(inp.rU64le())
+      let maxCols = int(inp.rU64le())
+      let totalRecs = int(inp.rU64le())
+      if maxCols > 5 or pageCount <= 0 or pageCount > 100000: fail("アーカイブが破損しています(dbcol meta)")
+      proc readPart(name: string): string =
+        let m = uint8(inp.rU8())
+        let osz = int(inp.rU64le())
+        let csz = int(inp.rU64le())
+        discard inp.rU64le()
+        if osz < 0 or csz < 0 or osz > 512*1024*1024 or csz > 512*1024*1024: fail("アーカイブが破損しています(dbcol size)")
+        var ms = newStringStream("")
+        case m
+        of MethodRaw:
+          copyExact(inp, ms, uint64(csz))
+        of MethodVm:
+          vmDecode(inp, ms, uint64(osz))
+        of MethodCatLz:
+          lzDecode(inp, ms, uint64(osz))
+        of MethodCatZ:
+          var cbuf = newString(csz)
+          if csz > 0 and inp.readData(addr cbuf[0], csz) != csz: fail("アーカイブが破損しています(dbcol read)")
+          var ds = newStringStream(cbuf)
+          catZDecode(ds, ms, uint64(osz))
+        else:
+          fail("アーカイブが破損しています(dbcol inner)")
+        ms.setPosition(0)
+        result = ms.readAll()
+        if result.len != osz: fail("アーカイブが破損しています(dbcol サイズ)")
+      let metaData = readPart("meta")
+      let rowData = readPart("row")
+      let rhData = readPart("rh")
+      var colData: array[5, string]
+      for j in 0..<5:
+        colData[j] = readPart("col" & $j)
+      let gapData = readPart("gap")
+      var rowPos = 0
+      var rhPos = 0
+      var colPos = [0, 0, 0, 0, 0]
+      var gapPos = 0
+      var mpos = 0
+      var dbData = newString(int(orig))
+      var recIdx = 0
+      for i in 0..<pageCount:
+        let start = i * pageSize
+        let endPos = min(start + pageSize, int(orig))
+        let base = if i == 0: 100 else: 0
+        let pgLen = endPos - (start + base)
+        if pgLen < 8: fail("アーカイブが破損しています(dbcol page)")
+        let ptype = if i == 0: int(uint8(metaData[mpos+100])) else: int(uint8(metaData[mpos]))
+        let hl = if ptype == 5: 12 else: 8
+        let ncells = if i == 0: int(uint8(metaData[mpos+100+3])) * 256 + int(uint8(metaData[mpos+100+4]))
+                     else: int(uint8(metaData[mpos+3])) * 256 + int(uint8(metaData[mpos+4]))
+        let pl = (if i == 0: 100 else: 0) + hl + 2*ncells
+        if mpos + pl > metaData.len: fail("アーカイブが破損しています(dbcol meta)")
+        dbData[start..<start+pl] = metaData[mpos..<mpos+pl]
+        var pts: seq[int] = @[]
+        let parr = mpos + (if i == 0: 100 else: 0) + hl
+        for c in 0..<ncells:
+          pts.add(int(uint8(metaData[parr+2*c])) * 256 + int(uint8(metaData[parr+2*c+1])))
+        mpos += pl
+        if mpos >= metaData.len: fail("アーカイブが破損しています(dbcol flag)")
+        let isRaw = int(uint8(metaData[mpos])) != 0
+        inc mpos
+        type RecInfo = tuple[cellOff: int, data: string]
+        var recs: seq[RecInfo] = @[]
+        if ptype == 13 and not isRaw:
+          for c in 0..<ncells:
+            # row stream holds [payload-size varint][rowid varint] per record
+            let (pszv, pszl, pok0) = sqliteVarint(rowData, rowPos, rowData.len)
+            if not pok0: fail("アーカイブが破損しています(dbcol varint)")
+            let (ridv, ridl, pok1) = sqliteVarint(rowData, rowPos+pszl, rowData.len)
+            if not pok1: fail("アーカイブが破損しています(dbcol varint)")
+            let (rhl, hl3, pok2) = sqliteVarint(rhData, rhPos, rhData.len)
+            if not pok2: fail("アーカイブが破損しています(dbcol varint)")
+            var q = rhPos + hl3
+            var colLens: array[5, int]
+            var ncol = 0
+            while q < rhPos + rhl:
+              let (st, ll, pok3) = sqliteVarint(rhData, q, rhData.len)
+              if not pok3: fail("アーカイブが破損しています(dbcol varint)")
+              let ln = sqliteSerLen(st)
+              if ln < 0 or ncol >= 5: fail("アーカイブが破損しています(dbcol serial)")
+              colLens[ncol] = ln
+              inc ncol
+              q += ll
+            var rec = rowData[rowPos..<rowPos+pszl+ridl] & rhData[rhPos..<rhPos+rhl]
+            for j in 0..<ncol:
+              if colPos[j] + colLens[j] > colData[j].len: fail("アーカイブが破損しています(dbcol col)")
+              rec.add(colData[j][colPos[j]..<colPos[j]+colLens[j]])
+              colPos[j] += colLens[j]
+            rowPos += pszl + ridl
+            rhPos += rhl
+            recs.add((pts[c], rec))
+            inc recIdx
+        # place records and fill gaps
+        var intervals: seq[tuple[s, e: int]] = @[]
+        for r in recs:
+          intervals.add((r.cellOff, r.cellOff + r.data.len))
+        intervals.sort(proc(a, b: tuple[s, e: int]): int = cmp(a.s, b.s))
+        for r in recs:
+          let absS = start + base + r.cellOff
+          if absS + r.data.len > endPos:
+            fail("アーカイブが破損しています(dbcol layout)")
+          dbData[absS..<absS+r.data.len] = r.data
+        let hl2 = if ptype == 5: 12 else: 8
+        if recs.len == 0 and not isRaw:
+          # empty leaf page: nothing to fill beyond prefix (cs should equal pgLen)
+          discard
+        elif isRaw:
+          # raw page: content area stored verbatim in gap stream
+          let contentStart = hl2 + 2*ncells
+          let contentLen = pgLen - contentStart
+          if contentLen > 0:
+            if gapPos + contentLen > gapData.len: fail("アーカイブが破損しています(dbcol gap)")
+            dbData[start+base+contentStart..<start+base+pgLen] = gapData[gapPos..<gapPos+contentLen]
+            gapPos += contentLen
+        else:
+          let cs = int(uint8(dbData[start+base+5])) * 256 + int(uint8(dbData[start+base+6]))
+          var g = cs
+          for iv in intervals:
+            if iv.s < g or iv.e > pgLen:
+              fail("アーカイブが破損しています(dbcol layout)")
+            if iv.s > g:
+              let glen = iv.s - g
+              if gapPos + glen > gapData.len: fail("アーカイブが破損しています(dbcol gap)")
+              dbData[start+base+g..<start+base+iv.s] = gapData[gapPos..<gapPos+glen]
+              gapPos += glen
+            g = max(g, iv.e)
+          if g < pgLen:
+            let glen = pgLen - g
+            if gapPos + glen > gapData.len: fail("アーカイブが破損しています(dbcol gap)")
+            dbData[start+base+g..<endPos] = gapData[gapPos..<gapPos+glen]
+            gapPos += glen
+      if recIdx != totalRecs: fail("アーカイブが破損しています(dbcol count)")
+      if gapPos != gapData.len: fail("アーカイブが破損しています(dbcol gap size)")
+      if rowPos != rowData.len: fail("アーカイブが破損しています(dbcol row size)")
+      if rhPos != rhData.len: fail("アーカイブが破損しています(dbcol rh size)")
+      f.write(dbData)
+      f.close()
+      echo "復元成功: ", finalTarget, " [REV-DBCU(可逆)]"
+      return
     elif ext == "json":
       var ms = newStringStream()
       case innerMth
@@ -3851,7 +4225,13 @@ proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
     catZDecode(msS, skelOut, skelOrig)
     lzDecode(msK, keysOut, keysOrig)
     catZDecode(msT, strsOut, strsOrig)
-    jsonReassemble(skelOut.data, keysOut.data, strsOut.data, orig.int64, f)
+    # BWT逆変換 (skeleton のみBWT済み、stringsは生)
+    skelOut.setPosition(0); strsOut.setPosition(0)
+    let skelBwt = skelOut.readAll(); let strs = strsOut.readAll()
+    if skelBwt.len < 4: fail("アーカイブが破損しています(JSON BWT)")
+    let skelPrim = int(uint8(skelBwt[0])) or (int(uint8(skelBwt[1])) shl 8) or (int(uint8(skelBwt[2])) shl 16) or (int(uint8(skelBwt[3])) shl 24)
+    let skel = bwtDecode(skelBwt[4..^1], skelPrim)
+    jsonReassemble(skel, keysOut.data, strs, orig.int64, f)
   else:
     unpackMp4(inp, f, comp)
   f.close()
@@ -3986,7 +4366,7 @@ when isMainModule:
     elif a == "--lossy":
       lossy = true
       safeAi = false
-    elif a.startsWith("--lossy="):
+    elif a.startswith("--lossy="):
       lossy = true
       safeAi = false
       try:
@@ -3997,12 +4377,12 @@ when isMainModule:
         quit("エラー: 品質 q は0〜51で指定してください")
     elif a == "--qbits":
       qbits = 0
-    elif a.startsWith("--base="):
+    elif a.startswith("--base="):
       baseMode = true
       baseDecP = a[7..^1]
     elif a == "--base":
       baseMode = true
-    elif a.startsWith("--qbits="):
+    elif a.startswith("--qbits="):
       let v = a[8..^1]
       if v == "auto":
         qbits = 0
@@ -4015,73 +4395,95 @@ when isMainModule:
           quit("エラー: --qbits は auto / 4 / 8 / 16 で指定してください(既定 auto)")
     else:
       rest.add a
-if rest.len >= 2 and rest[0] == "ztest":
-  proc dbgPrintTags() =
-    const names = ["other","rep","len","lenx","nbtree","extras","literal"]
-    for i in 0..<8:
-      if dbgTagBytes[i] > 0:
-        stderr.writeLine("BYTES ", names[i], "=", dbgTagBytes[i])
+  if rest.len >= 2 and rest[0] == "ztest":
+    proc dbgPrintTags() =
+      const names = ["other","rep","len","lenx","nbtree","extras","literal"]
+      for i in 0..<8:
+        if dbgTagBytes[i] > 0:
+          stderr.writeLine("BYTES ", names[i], "=", dbgTagBytes[i])
+    var fi = openFileStream(rest[1], fmRead)
+    var fo = openFileStream("/tmp/z.bin", fmWrite)
+    let n = catZEncode(fi, fo, uint64(getFileSize(rest[1])))
+    fi.close(); fo.close()
+    dbgPrintTags()
+    echo "encoded: ", n
+    var fi2 = openFileStream("/tmp/z.bin", fmRead)
+    var fo2 = openFileStream("/tmp/z.out", fmWrite)
+    catZDecode(fi2, fo2, uint64(getFileSize(rest[1])))
+    fi2.close(); fo2.close()
+    quit(0)
+  if rest.len >= 2 and rest[0] == "skewtest":
+    var fo = openFileStream("/tmp/rc.bin", fmWrite)
+    var e = rcInitE(fo)
+    var p = Prob(1 shl (ProbBits - 1))
+    for _ in 0..<200_000:
+      e.rcEncBit(p, 0)
+    e.rcFlush()
+    fo.close()
+    echo "skew encoded: ", getFileSize("/tmp/rc.bin"), " bytes"
+    var fi2 = openFileStream("/tmp/rc.bin", fmRead)
+    var d = rcInitD(fi2)
+    p = Prob(1 shl (ProbBits - 1))
+    var bad = 0
+    for _ in 0..<200_000:
+      if d.rcDecBit(p) != 0: inc bad
+    fi2.close()
+    echo "decode mismatches: ", bad
+    quit(0)
+  if rest.len >= 2 and rest[0] == "lztest":
+    var fi = openFileStream(rest[1], fmRead)
+    var fo = openFileStream("/tmp/lz.bin", fmWrite)
+    let n = lzEncode(fi, fo, uint64(getFileSize(rest[1])))
+    fi.close(); fo.close()
+    echo "encoded: ", n
+    var fi2 = openFileStream("/tmp/lz.bin", fmRead)
+    var fo2 = openFileStream("/tmp/lz.out", fmWrite)
+    lzDecode(fi2, fo2, uint64(getFileSize(rest[1])))
+    fi2.close(); fo2.close()
+    quit(0)
 
-  # 開発用: catZEncode -> catZDecode 単体ラウンドトリップ検証
-  var fi = openFileStream(rest[1], fmRead)
-  var fo = openFileStream("/tmp/z.bin", fmWrite)
-  let n = catZEncode(fi, fo, uint64(getFileSize(rest[1])))
-  fi.close(); fo.close()
-  dbgPrintTags()
-  echo "encoded: ", n
-  var fi2 = openFileStream("/tmp/z.bin", fmRead)
-  var fo2 = openFileStream("/tmp/z.out", fmWrite)
-  catZDecode(fi2, fo2, uint64(getFileSize(rest[1])))
-  fi2.close(); fo2.close()
-  quit(0)
+  if rest.len >= 8 and rest[0] == "ztune":
+    let path = rest[1]
+    let pm = parseInt(rest[2]); let pb = parseInt(rest[3]); let ob = parseInt(rest[4])
+    let priced = parseInt(rest[5]) != 0; let greedy = parseInt(rest[6]) != 0; let mc = parseInt(rest[7])
+    let origSize = uint64(getFileSize(path))
+    var fi = openFileStream(path, fmRead)
+    var fo = newStringStream("")
+    fo.write uint8(pm or (pb shl 4))
+    discard catZEncodeCore(fi, fo, origSize, pm, pb, ob, priced, greedy, mc)
+    fi.close()
+    fo.setPosition(0)
+    let z = fo.readAll()
+    var ds = newStringStream(z)
+    var outp = newStringStream("")
+    try:
+      catZDecode(ds, outp, origSize)
+    except CatchableError as e:
+      echo "FAIL decode: ", e.msg
+      quit(2)
+    outp.setPosition(0)
+    let o = outp.readAll()
+    var f = openFileStream(path, fmRead)
+    var orig = newString(int(origSize))
+    discard f.readData(addr orig[0], int(origSize))
+    f.close()
+    echo "comp=", z.len, " ok=", (o == orig)
+    quit(if o == orig: 0 else: 3)
 
-if rest.len >= 2 and rest[0] == "skewtest":
-  # 開発用: 適応テスト(同一ビット20万回→モデル適応で極小になるはず)
-  var fo = openFileStream("/tmp/rc.bin", fmWrite)
-  var e = rcInitE(fo)
-  var p = Prob(1 shl (ProbBits - 1))
-  for _ in 0..<200_000:
-    e.rcEncBit(p, 0)
-  e.rcFlush()
-  fo.close()
-  echo "skew encoded: ", getFileSize("/tmp/rc.bin"), " bytes (適応OKなら数百バイト程度)"
-  var fi2 = openFileStream("/tmp/rc.bin", fmRead)
-  var d = rcInitD(fi2)
-  p = Prob(1 shl (ProbBits - 1))
-  var bad = 0
-  for _ in 0..<200_000:
-    if d.rcDecBit(p) != 0: inc bad
-  fi2.close()
-  echo "decode mismatches: ", bad
-  quit(0)
-
-if rest.len >= 2 and rest[0] == "lztest":
-  # 開発用: lzEncode -> lzDecode 単体ラウンドトリップ検証
-  var fi = openFileStream(rest[1], fmRead)
-  var fo = openFileStream("/tmp/lz.bin", fmWrite)
-  let n = lzEncode(fi, fo, uint64(getFileSize(rest[1])))
-  fi.close(); fo.close()
-  echo "encoded: ", n
-  var fi2 = openFileStream("/tmp/lz.bin", fmRead)
-  var fo2 = openFileStream("/tmp/lz.out", fmWrite)
-  lzDecode(fi2, fo2, uint64(getFileSize(rest[1])))
-  fi2.close(); fo2.close()
-  quit(0)
-
-if rest.len < 3:
-  stdout.write Usage
-  quit(1)
-case rest[0]
-of "c":
-  try:
-    runPack(rest[1], rest[2], lossy, q, qbits, baseMode, safeAi)
-  except CatchableError as e:
-    quit("エラー: " & e.msg)
-of "d":
-  try:
-    runUnpack(rest[1], rest[2], baseDecP)
-  except CatchableError as e:
-    quit("エラー: " & e.msg)
-else:
-  stdout.write Usage
-  quit(1)
+  if rest.len < 3:
+    stdout.write Usage
+    quit(1)
+  case rest[0]
+  of "c":
+    try:
+      runPack(rest[1], rest[2], lossy, q, qbits, baseMode, safeAi)
+    except CatchableError as e:
+      quit("エラー: " & e.msg)
+  of "d":
+    try:
+      runUnpack(rest[1], rest[2], baseDecP)
+    except CatchableError as e:
+      quit("エラー: " & e.msg)
+  else:
+    stdout.write Usage
+    quit(1)
