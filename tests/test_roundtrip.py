@@ -45,6 +45,7 @@ class CatBase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls.CC = os.path.abspath(cls.CC)
         if not os.path.exists(cls.CC):
             raise unittest.SkipTest(f"binary not found: {cls.CC} (build first)")
 

@@ -168,6 +168,7 @@ class QualityBase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls.CC = os.path.abspath(cls.CC)
         if not os.path.exists(cls.CC):
             raise unittest.SkipTest("binary not found: %s (build first)" % cls.CC)
 
