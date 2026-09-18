@@ -559,7 +559,7 @@ proc lzEncode(src, dst: Stream, inputLimit: uint64): uint64 =
     inc nflags
     if nflags == 8: flushGroup()
 
-  proc emitMatch(off, l: int) =
+  proc emitMatch(off: int64, l: int) =
     inc dbgMth; dbgMlen += l
     var tok = ""
     if off <= 65535:
@@ -921,7 +921,7 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
 
   var dbgMlenZ = 0
 
-  proc emitMatch(off, l: int, pos: int) =
+  proc emitMatch(off: int64, l: int, pos: int) =
     dbgMlenZ += l
     let tagSave = dbgTagId
     # rep offset 判定

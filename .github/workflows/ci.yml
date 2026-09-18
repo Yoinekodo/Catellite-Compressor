@@ -31,10 +31,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Nim (${{ matrix.nim }})
+      - name: Set up Nim (${{ matrix.nim }}) - Linux/macOS
+        if: runner.os != 'Windows'
         uses: jiro4989/setup-nim-action@v1
         with:
           nim-version: ${{ matrix.nim }}
+
+      - name: Install Nim via Chocolatey (${{ matrix.nim }}) - Windows
+        if: runner.os == 'Windows'
+        run: |
+          choco install nim --version=${{ matrix.nim }} -y
+          refreshenv
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
