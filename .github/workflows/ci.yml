@@ -24,8 +24,6 @@ jobs:
             nim: "1.6.16"
           - os: windows-latest
             nim: "2.2.10"
-          - os: windows-latest
-            nim: "1.6.16"
 
     steps:
       - name: Checkout repository

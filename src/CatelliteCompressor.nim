@@ -972,7 +972,7 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
         let bs = zNbBase[nb]
         var m = 0
         for k in countdown(nb - 2, 0):
-          let bit = (ev shr k) and 1
+          let bit = int((ev shr k) and 1)
           e.rcEncBit(obP[bs + m], bit)
           m = (m shl 1) + bit
       prevOffsetNb = nb
