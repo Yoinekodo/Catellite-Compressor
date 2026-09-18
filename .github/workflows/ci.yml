@@ -39,7 +39,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           choco install nim --version=${{ matrix.nim }} -y
-          refreshenv
+          $env:PATH = "C:\tools\Nim\nim-${{ matrix.nim }}\bin;${env:USERPROFILE}\.nimble\bin;$env:PATH"
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
