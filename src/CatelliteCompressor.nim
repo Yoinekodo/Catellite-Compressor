@@ -1,7 +1,87 @@
-import std/[os, strutils, streams, algorithm, json, math]
+import std/[os, strutils, streams, algorithm, json, math, times, base64]
+
+# ---- SHA-256 (pure Nim, no external deps) ----
+proc sha256(data: openArray[byte]): array[32, byte] =
+  const
+    K = [
+      0x428a2f98'u32, 0x71374491'u32, 0xb5c0fbcf'u32, 0xe9b5dba5'u32,
+      0x3956c25b'u32, 0x59f111f1'u32, 0x923f82a4'u32, 0xab1c5ed5'u32,
+      0xd807aa98'u32, 0x12835b01'u32, 0x243185be'u32, 0x550c7dc3'u32,
+      0x72be5d74'u32, 0x80deb1fe'u32, 0x9bdc06a7'u32, 0xc19bf174'u32,
+      0xe49b69c1'u32, 0xefbe4786'u32, 0x0fc19dc6'u32, 0x240ca1cc'u32,
+      0x2de92c6f'u32, 0x4a7484aa'u32, 0x5cb0a9dc'u32, 0x76f988da'u32,
+      0x983e5152'u32, 0xa831c66d'u32, 0xb00327c8'u32, 0xbf597fc7'u32,
+      0xc6e00bf3'u32, 0xd5a79147'u32, 0x06ca6351'u32, 0x14292967'u32,
+      0x27b70a85'u32, 0x2e1b2138'u32, 0x4d2c6dfc'u32, 0x53380d13'u32,
+      0x650a7354'u32, 0x766a0abb'u32, 0x81c2c92e'u32, 0x92722c85'u32,
+      0xa2bfe8a1'u32, 0xa81a664b'u32, 0xc24b8b70'u32, 0xc76c51a3'u32,
+      0xd192e819'u32, 0xd6990624'u32, 0xf40e3585'u32, 0x106aa070'u32,
+      0x19a4c116'u32, 0x1e376c08'u32, 0x2748774c'u32, 0x34b0bcb5'u32,
+      0x391c0cb3'u32, 0x4ed8aa4a'u32, 0x5b9cca4f'u32, 0x682e6ff3'u32,
+      0x748f82ee'u32, 0x78a5636f'u32, 0x84c87814'u32, 0x8cc70208'u32,
+      0x90befffa'u32, 0xa4506ceb'u32, 0xbef9a3f7'u32, 0xc67178f2'u32
+    ]
+  var h = [
+    0x6a09e667'u32, 0xbb67ae85'u32, 0x3c6ef372'u32, 0xa54ff53a'u32,
+    0x510e527f'u32, 0x9b05688c'u32, 0x1f83d9ab'u32, 0x5be0cd19'u32
+  ]
+  var msg = newSeq[byte](data.len + 1 + 8)
+  for i in 0..<data.len: msg[i] = data[i]
+  msg[data.len] = 0x80'u8
+  let bitLen = uint64(data.len) * 8
+  for i in 0..<8: msg[msg.high - 7 + i] = byte((bitLen shr (8 * (7 - i))) and 0xFF)
+  var w: array[64, uint32]
+  for blockStart in countup(0, msg.high - 63, 64):
+    for t in 0..15:
+      let i = blockStart + t * 4
+      w[t] = uint32(msg[i]) shl 24
+      w[t] = w[t] or (uint32(msg[i+1]) shl 16)
+      w[t] = w[t] or (uint32(msg[i+2]) shl 8)
+      w[t] = w[t] or uint32(msg[i+3])
+    for t in 16..63:
+      let s0 = (w[t-15] shr 7 or w[t-15] shl 25) xor
+               (w[t-15] shr 18 or w[t-15] shl 14) xor
+               (w[t-15] shr 3)
+      let s1 = (w[t-2] shr 17 or w[t-2] shl 15) xor
+               (w[t-2] shr 19 or w[t-2] shl 13) xor
+               (w[t-2] shr 10)
+      w[t] = w[t-16] + s0 + w[t-7] + s1
+    var a = h[0]; var b = h[1]; var c = h[2]; var d = h[3]
+    var e = h[4]; var f = h[4]; var g = h[6]; var h1 = h[7]
+    for t in 0..63:
+      let S1 = (e shr 6 or e shl 26) xor (e shr 11 or e shl 21) xor (e shr 25 or e shl 7)
+      let ch = (e and f) xor ((not e) and g)
+      let temp1 = h1 + S1 + ch + K[t] + w[t]
+      let S0 = (a shr 2 or a shl 30) xor (a shr 13 or a shl 19) xor (a shr 22 or a shl 10)
+      let maj = (a and b) xor (a and c) xor (b and c)
+      let temp2 = S0 + maj
+      h1 = g; g = f; f = e; e = d + temp1
+      d = c; c = b; b = a; a = temp1 + temp2
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d
+    h[4] += e; h[5] += f; h[6] += g; h[7] += h1
+  var hashOut: array[32, byte]
+  for i in 0..7:
+    for j in 0..3:
+      hashOut[i*4 + j] = byte((h[i] shr (8*(3-j))) and 0xFF)
+  return hashOut
+
+proc sha256File(path: string): array[32, byte] =
+  let sz = getFileSize(path).int
+  var f: File
+  if not f.open(path, fmRead):
+    raise newException(IOError, "ファイルを開けません: " & path)
+  var data = newSeq[byte](sz.Natural)
+  discard f.readBytes(data, 0, sz.Natural)
+  f.close()
+  return sha256(data)
+
+proc sha256Hex(h: array[32, byte]): string =
+  var sb = ""
+  for b in h: sb.add b.toHex(2).toLowerAscii
+  return sb
 
 const CatMagic = "CATCOMP1"
-const FormatVersion = 1.uint8
+const FormatVersion = 2.uint8
 const WindowSize = 65535
 const LzWindow = 65535
 const MinMatch = 4  # old LZ constant (CAT-Z overrides to 8)
@@ -104,6 +184,49 @@ proc rU64le(s: Stream): uint64 =
 
 proc fail(msg: string) =
   raise newException(IOError, msg)
+
+# ---- CRC32C (Castagnoli, reflected) ----
+const crc32cTable = block:
+  var t: array[256, uint32]
+  for i in 0..255:
+    var c = uint32(i)
+    for _ in 0..<8:
+      c = if (c and 1) != 0: (c shr 1) xor 0x82F63B78'u32 else: c shr 1
+    t[i] = c
+  t
+
+proc crc32cFile(path: string): uint32 =
+  var f = openFileStream(path, fmRead)
+  var ch = newString(1 shl 18)
+  var crc = 0xFFFFFFFF'u32
+  while not f.atEnd():
+    let n = f.readData(addr ch[0], ch.len)
+    if n <= 0: break
+    for i in 0..<n:
+      crc = crc32cTable[int((crc xor uint32(uint8(ch[i]))) and 0xFF)] xor (crc shr 8)
+  f.close()
+  crc xor 0xFFFFFFFF'u32
+
+# エントリ末尾トレーラ: checksumType(u8) + checksum(u32LE)
+#   type 0 = 検証なし(非可逆エントリ) / type 1 = CRC32C(原文 or 復元後ファイル)
+proc entryCsumWrite(s: Stream, ctype: uint8, cval: uint32) =
+  s.write ctype
+  s.write uint8(cval and 0xFF)
+  s.write uint8((cval shr 8) and 0xFF)
+  s.write uint8((cval shr 16) and 0xFF)
+  s.write uint8((cval shr 24) and 0xFF)
+
+proc verifyEntryCsum(inp: Stream, ver: int, finalPath: string) =
+  if ver < 2: return
+  let ctype = uint8(inp.rU8())
+  let cval = rU32le(inp)
+  if ctype == 1:
+    let got = crc32cFile(finalPath)
+    if got != uint32(cval):
+      try: removeFile(finalPath)
+      except CatchableError: discard
+      fail("復元データの整合性チェックに失敗しました(CRC32C不一致): " & finalPath & "\n" &
+           "       アーカイブが破損しているか、元データと異なる内容が復元されています")
 
 proc hashAt(buf: string, i: int): uint32 =
   let x = uint32(uint8(buf[i])) or
@@ -2005,8 +2128,10 @@ proc tensorDeltaSplit(curPath, basePath: string, cont: var string,
       pos += take
     discard written
   fc.close(); fb.close()
+  let baseSha = sha256File(basePath)
   var c = ""
   c.add char(0x44); c.add char(0x54); c.add char(0x31); c.add char(0x00)   # "DT1\0"
+  for b in baseSha: c.add char(b)   # base model SHA-256 (32 bytes)
   proc addU64l(s: var string, v: uint64) =
     for k in 0..<8:
       s.add char(uint8((v shr (k * 8)) and 0xFF))
@@ -2020,10 +2145,16 @@ proc tensorDeltaSplit(curPath, basePath: string, cont: var string,
   result = true
 
 proc tensorDeltaApply(cont, basePath: string, dst: Stream) =
-  if cont.len < 32: fail("アーカイブが破損しています(DELTA先頭)")
+  if cont.len < 64: fail("アーカイブが破損しています(DELTA先頭)")
   if uint8(cont[0]) != 0x44 or uint8(cont[1]) != 0x54 or uint8(cont[2]) != 0x31:
     fail("アーカイブが破損しています(DELTA magic)")
   var p = 4
+  var storedSha: array[32, byte]
+  for i in 0..31: storedSha[i] = uint8(cont[p + i])
+  inc(p, 32)
+  let baseSha = sha256File(basePath)
+  if baseSha != storedSha:
+    fail("基準モデルのSHA-256が一致しません。アーカイブ作成時に使用した --base と同一のファイルを指定してください。")
   var cjlen: uint64 = 0
   for k in 0..<8:
     cjlen = cjlen or (uint64(uint8(cont[p + k])) shl (k * 8))
@@ -2077,7 +2208,7 @@ proc tensorDeltaApply(cont, basePath: string, dst: Stream) =
     while pos < blen:
       let take = min(CH3, blen - pos)
       copyMem(addr dd[0], unsafeAddr cont[dataStart + dataOff], take)
-      f.setFilePos(bDataBase + bestB + st + pos)
+      f.setFilePos(bDataBase + bestB + pos)
       discard f.readBuffer(addr bb[0], take)
       for j in 0..<take:
         dd[j] = char(uint8(dd[j]) + uint8(bb[j]))
@@ -2803,7 +2934,7 @@ proc packTensorQuant(outp: Stream, kind: uint8, relPath: string,
   outp.wU64le(uint64(produced))          # transSize = 量子化済み safetensors 原寸
   outp.wU64le(chosenSize)                # 圧縮後サイズ
   chosenStream.setPosition(0)
-  copyExact(chosenStream, outp, chosenSize)
+  copyExact(chosenStream, outp, chosenSize); entryCsumWrite(outp, 0, 0)
   if sinkFile != "":
     try: removeFile(sinkFile)
     except CatchableError: discard
@@ -3011,6 +3142,14 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
                skelOrigCache: var uint64, keysOrigCache: var uint64, strsOrigCache: var uint64) =
   let origF = getFileSize(srcPath)
   if relPath.len > 255: fail("パスが長すぎます(255byte以内): " & relPath)
+  # 可逆エントリ用の原文CRC32C(初回使用時のみ計算。非可逆変換はスキップ対象)
+  var srcCrc = 0.uint32
+  var srcCrcSet = false
+  proc needSrcCrc(): uint32 =
+    if not srcCrcSet:
+      srcCrc = crc32cFile(srcPath)
+      srcCrcSet = true
+    srcCrc
 
   # --- 差分(--base) ファストパス: 基準モデルとのバイト差分を可逆格納 ---
   if baseP != "" and origF >= 4096 and origF <= 512 * 1024 * 1024 and
@@ -3042,7 +3181,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
       let dataComp = uint64(aft - iph - 8)
       outp.setPosition(iph); outp.wU64le(dataComp)
       let compL = uint64(aft - payStart)
-      outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft)
+      outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft); entryCsumWrite(outp, 1, needSrcCrc())
       inc revCount
       let pct = 100.0 - float(compL) / float(origF) * 100.0
       echo "追加: ", dispName, " [REV-DELTA vs ", extractFilename(baseP), "] ",
@@ -3087,7 +3226,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
         let dataComp = uint64(aft - iph - 8)
         outp.setPosition(iph); outp.wU64le(dataComp)
         let compL = uint64(aft - payStart)
-        outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft)
+        outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft); entryCsumWrite(outp, 1, needSrcCrc())
         inc revCount
         let pct = 100.0 - float(compL) / float(origF) * 100.0
         echo "追加: ", dispName, " [REV-JSON(可逆)] ", origF, " → ", compL, " bytes (", pct.formatFloat(ffDecimal, 1), "%削減)"
@@ -3134,7 +3273,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
           let dataComp = uint64(aft - iph - 8)
           outp.setPosition(iph); outp.wU64le(dataComp)
           let compL = uint64(aft - payStart)
-          outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft)
+          outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft); entryCsumWrite(outp, 1, needSrcCrc())
           inc revCount
           let pct = 100.0 - float(compL) / float(origF) * 100.0
           echo "追加: ", dispName, " [REV-BWT(可逆)] ", origF, " → ", compL, " bytes (", pct.formatFloat(ffDecimal, 1), "%削減)"
@@ -3179,7 +3318,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
           let dataComp = uint64(aft - iph - 8)
           outp.setPosition(iph); outp.wU64le(dataComp)
           let compL = uint64(aft - payStart)
-          outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft)
+          outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft); entryCsumWrite(outp, 1, needSrcCrc())
           inc revCount
           let pct = 100.0 - float(compL) / float(origF) * 100.0
           echo "追加: ", dispName, " [REV-BWT(可逆)] ", origF, " → ", compL, " bytes (", pct.formatFloat(ffDecimal, 1), "%削減)"
@@ -3445,7 +3584,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
       writePart(MethodCatLz, gapOrig.len, zGap)
       let aft = outp.getPosition()
       let compL = uint64(aft - payStart)
-      outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft)
+      outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft); entryCsumWrite(outp, 1, needSrcCrc())
       inc revCount
       let pct = 100.0 - float(compL) / float(origF) * 100.0
       echo "追加: ", dispName, " [REV-DBCU(可逆)] ", origF, " → ", compL, " bytes (", pct.formatFloat(ffDecimal, 1), "%削減)"
@@ -3523,7 +3662,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
               outp.write zdataP
               let aft = outp.getPosition()
               let compL = uint64(aft - payStart)
-              outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft)
+              outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft); entryCsumWrite(outp, 1, needSrcCrc())
               inc revCount
               let pct = 100.0 - float(compL) / float(origF) * 100.0
               echo "追加: ", dispName, " [REV-DB(可逆)] ", origF, " → ", compL, " bytes (", pct.formatFloat(ffDecimal, 1), "%削減)"
@@ -3559,7 +3698,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
       let dataComp = uint64(aft - iph - 8)
       outp.setPosition(iph); outp.wU64le(dataComp)
       let compL = uint64(aft - payStart)
-      outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft)
+      outp.setPosition(compPos); outp.wU64le(compL); outp.setPosition(aft); entryCsumWrite(outp, 1, needSrcCrc())
       inc revCount
       let pct = 100.0 - float(compL) / float(origF) * 100.0
       echo "追加: ", dispName, " [REV-NNTENSOR] ",
@@ -3648,6 +3787,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
           outp.setPosition(compPos)
           outp.wU64le(compL)
           outp.setPosition(aft)
+          entryCsumWrite(outp, 0, 0)
           removeFile(tmp)
           inc lossyCount
           let pct = 100.0 - float(compL) / float(origF) * 100.0
@@ -3823,6 +3963,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
     outp.wU64le(comp)
     outp.setPosition(aft)
     inc mp4Count
+  entryCsumWrite(outp, 1, needSrcCrc())
   let pct = if origF > 0: 100.0 - float(comp) / float(origF) * 100.0 else: 0.0
   echo "追加: ", dispName, " [", methodName(mth), "] ",
        origF, " → ", comp, " bytes (", pct.formatFloat(ffDecimal, 1), "%削減)"
@@ -3832,7 +3973,7 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
 proc target0(outBase: string, kind: uint8, rel: string): string =
   if kind == KindSingle: outBase else: outBase / rel
 
-proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
+proc unpackEntry(inp: Stream, outBase: string, kind: uint8, ver: int, baseP = "") =
   let plen = int(inp.rU8())
   var rel = newString(plen)
   if plen > 0 and inp.readData(addr rel[0], plen) != plen:
@@ -3883,6 +4024,7 @@ proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
       msD.setPosition(0)
       tensorDeltaApply(msD.readAll(), baseP, f)
       f.close()
+      verifyEntryCsum(inp, ver, finalTarget)
       echo "復元成功: ", finalTarget, " [REV-DELTA(可逆・base適用)]"
       return
     elif ext == "db":
@@ -3945,6 +4087,7 @@ proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
             dbData[start+8..<endPos] = pagePayloads[i]
       f.write(dbData)
       f.close()
+      verifyEntryCsum(inp, ver, finalTarget)
       echo "復元成功: ", finalTarget, " [REV-DB(可逆)]"
       return
     elif ext == "dbcol":
@@ -4088,6 +4231,7 @@ proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
       if rhPos != rhData.len: fail("アーカイブが破損しています(dbcol rh size)")
       f.write(dbData)
       f.close()
+      verifyEntryCsum(inp, ver, finalTarget)
       echo "復元成功: ", finalTarget, " [REV-DBCU(可逆)]"
       return
     elif ext == "json":
@@ -4115,6 +4259,7 @@ proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
       if tlen > 0: discard ms.readData(addr strsC[0], tlen)
       jsonReassemble(skelC, keysC, strsC, int64(orig), f)
       f.close()
+      verifyEntryCsum(inp, ver, finalTarget)
       echo "復元成功: ", finalTarget, " [REV-JSON(可逆)]"
       return
     elif ext == "bwt":
@@ -4139,6 +4284,7 @@ proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
       if decoded.len != int(orig): fail("アーカイブが破損しています(BWT サイズ)")
       f.write(decoded)
       f.close()
+      verifyEntryCsum(inp, ver, finalTarget)
       echo "復元成功: ", finalTarget, " [REV-BWT(可逆)]"
       return
     elif ext == "safetensors":
@@ -4181,6 +4327,7 @@ proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
       else:
         fail("アーカイブが破損しています(lossy method)")
     f.close()
+    verifyEntryCsum(inp, ver, finalTarget)
     if ext == "db":
       echo "復元成功: ", finalTarget, " [REPACK(可逆)]"
       echo "  ※ SQLite VACUUM 等の再圧縮は可逆です。元のファイルと同一です"
@@ -4236,6 +4383,7 @@ proc unpackEntry(inp: Stream, outBase: string, kind: uint8, baseP = "") =
   else:
     unpackMp4(inp, f, comp)
   f.close()
+  verifyEntryCsum(inp, ver, target)
   echo "復元成功: ", target, " [", methodName(mth), "]"
 
 proc collectFiles(dir, root: string, list: var seq[tuple[rel, abs: string]]) =
@@ -4245,7 +4393,7 @@ proc collectFiles(dir, root: string, list: var seq[tuple[rel, abs: string]]) =
     elif kindEl == pcFile:
       list.add((relativePath(path, root), path))
 
-proc runPack(input, output: string, lossy = true, q = 51, qbits = 0, baseMode = false, safeAi = false) =
+proc runPack(input, output: string, lossy = true, q = 51, qbits = 0, baseMode = false, safeAi = false, basePackP = "") =
   let outputFile = if splitFile(output).ext == ".catcmp": output else: output & ".catcmp"
   if not (fileExists(input) or dirExists(input)):
     fail("入力が存在しません: " & input)
@@ -4264,10 +4412,10 @@ proc runPack(input, output: string, lossy = true, q = 51, qbits = 0, baseMode = 
            "       復元する場合は d を使用してください")
     f.close()
   var modeStr = if baseMode: " [モデルモード(--base)]" elif safeAi: " [セーフAIモード]" elif lossy: " [スマートモード]" else: " [セーフモード]"
-  echo "[*] CatelliteCompressor v2: パック中", modeStr, "..."
-  # --base: 最初のsafetensorsファイルを見つけて基準モデルとして使用
-  var baseP = ""
-  if baseMode:
+  echo "[*] CatelliteCompressor v", FormatVersion, ": パック中", modeStr, "..."
+  # --base: 明示指定 --base=PATH を優先、未指定なら従来通り自動検出
+  var baseP = basePackP
+  if baseMode and baseP == "":
     if dirExists(input):
       var blist: seq[tuple[rel, abs: string]] = @[]
       collectFiles(input, input, blist)
@@ -4283,6 +4431,8 @@ proc runPack(input, output: string, lossy = true, q = 51, qbits = 0, baseMode = 
       if bext in tensorExts:
         baseP = input
         echo "[*] 基準モデル: ", extractFilename(baseP)
+  if baseP != "":
+    echo "[*] 基準モデル: ", extractFilename(baseP)
   var fs = openFileStream(outputFile, fmWrite)
   fs.write CatMagic
   fs.write FormatVersion
@@ -4338,14 +4488,21 @@ proc runUnpack(input, output: string, baseP = "") =
     fail("ファイルが短すぎます: " & inputFile)
   if magic != CatMagic:
     fail("CatelliteCompressorのフォーマット(.catcmp)ではありません。")
-  discard fs.readUint8()
-  echo "[*] CatelliteCompressor v2: 展開中..."
+  let ver = int(fs.readUint8())
+  if ver < 1 or ver > 2:
+    fail("未対応のフォーマットバージョンです: " & $ver)
+  echo "[*] CatelliteCompressor v", ver, ": 展開中"
+  var nEntries = 0
   while true:
     let kind = uint8(fs.rU8())
-    if kind == KindEnd: break
+    if kind == KindEnd:
+      if nEntries == 0:
+        fail("アーカイブが破損しています(エントリが見つかりません)")
+      break
     if kind != KindSingle and kind != KindMember:
       fail("アーカイブが破損しています(kind)")
-    unpackEntry(fs, output, kind, baseP)
+    unpackEntry(fs, output, kind, ver, baseP)
+    inc nEntries
   fs.close()
   echo "[+] 復元完了: ", output
 
@@ -4357,6 +4514,8 @@ when isMainModule:
   var qbits = 0
   var baseMode = false
   var baseDecP = ""   # d 時の --base=PATH (復元用基準モデル)
+  var basePackP = ""  # c 時の --base=PATH (圧縮用基準モデル)
+  var expectBasePack = false  # 次の引数が --base のパス
   for a in commandLineParams():
     if a == "--safe":
       lossy = false
@@ -4380,9 +4539,15 @@ when isMainModule:
       qbits = 0
     elif a.startswith("--base="):
       baseMode = true
+      basePackP = a[7..^1]
       baseDecP = a[7..^1]
     elif a == "--base":
       baseMode = true
+      expectBasePack = true
+    elif expectBasePack:
+      basePackP = a
+      baseDecP = a
+      expectBasePack = false
     elif a.startswith("--qbits="):
       let v = a[8..^1]
       if v == "auto":
@@ -4471,16 +4636,24 @@ when isMainModule:
     echo "comp=", z.len, " ok=", (o == orig)
     quit(if o == orig: 0 else: 3)
 
-  if rest.len < 3:
+  if rest.len < 2 or (rest[0] == "c" and rest.len < 3 and basePackP == ""):
     stdout.write Usage
     quit(1)
+  var outPath = ""
   case rest[0]
   of "c":
+    if rest.len >= 3:
+      outPath = rest[2]
+    else:
+      outPath = rest[1] & ".catcmp"
     try:
-      runPack(rest[1], rest[2], lossy, q, qbits, baseMode, safeAi)
+      runPack(rest[1], outPath, lossy, q, qbits, baseMode, safeAi, basePackP)
     except CatchableError as e:
       quit("エラー: " & e.msg)
   of "d":
+    if rest.len < 3:
+      stdout.write Usage
+      quit(1)
     try:
       runUnpack(rest[1], rest[2], baseDecP)
     except CatchableError as e:

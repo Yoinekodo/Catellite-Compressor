@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Nim ${{ matrix.nim }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            nim: "2.2"
+          - os: ubuntu-latest
+            nim: "1.6"
+          - os: macos-latest
+            nim: "2.2"
+          - os: macos-latest
+            nim: "1.6"
+          - os: windows-latest
+            nim: "2.2"
+          - os: windows-latest
+            nim: "1.6"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nim (${{ matrix.nim }})
+        uses: jiro4989/setup-nim-action@v1
+        with:
+          nim-version: ${{ matrix.nim }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 git
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install python3 git
+
+      - name: Build (release)
+        run: |
+          nim c -d:release -o:src/CatelliteCompressor src/CatelliteCompressor.nim
+
+      - name: Run quality tests
+        run: |
+          python3 tests/test_quality.py --cc src/CatelliteCompressor
+
+      - name: Run roundtrip tests
+        if: runner.os != 'Windows'
+        timeout-minutes: 15
+        run: |
+          python3 tests/test_roundtrip.py --cc src/CatelliteCompressor
+
+      - name: Run roundtrip tests (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 15
+        run: |
+          python3 tests/test_roundtrip.py --cc src/CatelliteCompressor.exe
+
+      - name: Verify binary runs
+        run: |
+          src/CatelliteCompressor c --help 2>&1 | head -1
+          src/CatelliteCompressor d --help 2>&1 | head -1

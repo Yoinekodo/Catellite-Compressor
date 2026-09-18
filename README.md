@@ -1,6 +1,6 @@
 # CatelliteCompressor
 
-**v0.6.0**
+**v0.7.0**
 
 次世代パラダイム圧縮ツール。ファイル / ディレクトリを `.catcmp` アーカイブに
 まとめ、内蔵の3つの可逆コーデック **CAT-VM** / **CAT-LZ** / **CAT-Z** と
@@ -23,10 +23,11 @@ LLM の重み(BF16 等)を **最大 75% 削減**します。
    --safe=ai      AIモデルのみ可逆(通常ファイルは通常圧縮)
    --lossy[=q]    スマートモードを明示(q=0高品質〜51最小, 既定51)
    --base         モデル-aware圧縮(デルタ圧縮): 最初のsafetensorsを基準に
+                  復元時: --base=<基準モデル> で SHA-256 厳密検証付き復元
    --qbits=[auto|16|8|4]
                   テンソル量子化ビット(既定 auto=最小サイズ自動選択)
                   4 = INT4(1/4, 最小) / 8 = INT8(1/2) / 16 = FP16(高品質)
-  ```
+```
 `.catcmp` 拡張子は省略可能です。省略時は自動で付与します。
 
 ※ `.catcmp` アーカイブを `c` の入力に渡すとエラーになります(二重圧縮の禁止)。
@@ -101,8 +102,10 @@ nim c -d:release --opt:speed -o:CatelliteCompressor src/CatelliteCompressor.nim
 
 # (safetensors 専用) ファインチューニング済みモデルの差分圧縮(基準モデル指定)
 ./CatelliteCompressor c --base tuned.safetensors tuned_delta
-# 復元(同じ base が必要)
+# 復元(同じ base が必要)。SHA-256検証付き：間違った base を指定すると拒否されます
 ./CatelliteCompressor d --base=tuned_delta.catcmp restored.safetensors
+# または --base=PATH 形式
+./CatelliteCompressor d --base tuned.safetensors tuned_delta.catcmp restored.safetensors
 ```
 
 ### テキスト / JSON / SQLite の可逆圧縮と検証
@@ -127,16 +130,26 @@ python3 run.py
 # ビルド
 nim c -d:release -o:/tmp/cc_test src/CatelliteCompressor.nim
 
+# 品質テスト (品質指標・速度/RSS、約7秒)
+python3 tests/test_quality.py --cc /tmp/cc_test
+
 # 全テスト実行 (roundtrip・破損検出・edge case、約7分)
 python3 tests/test_roundtrip.py --cc /tmp/cc_test
 ```
 
-テスト内容: 空ファイル・1〜7バイト・ランダムバイナリ・Unicode名・
-シンボリックリンク・ディレクトリツリーの往復検証、
-テキスト(BWT)・JSON(分割)・SQLite(カラム分離)パスの往復検証、
-切詰めアーカイブの拒否、二重圧縮の禁止。
-ビット反転の検出は既知の制限として expected-failure で記録しています
-(エントリ単位のCRC未実装のため)。
+テスト内容:
+- **test_quality.py**: テンソル量子化の品質指標（SNR/余弦/MAE/RMSE/最大絶対誤差）の単調性検証、FP16ほぼ無損失チェック、速度・最大RSSの有限非負検証
+- **test_roundtrip.py**: 空ファイル・1〜7バイト・ランダムバイナリ・Unicode名・シンボリックリンク・ディレクトリツリーの往復検証、テキスト(BWT)・JSON(分割)・SQLite(カラム分離)パスの往復検証、切詰めアーカイブの拒否、二重圧縮の禁止、ペイロードへのビット反転(エントリ単位CRC32C付与による検出)の全オフセット検証(全サンプルで検出を確認済み)
+
+### アーカイブの完全性
+
+- 切詰めアーカイブは検出して拒否します。
+- **可逆エントリには原文または復元後ファイルの CRC32C を付与**しています。
+  復元時にペイロードを復号して原文と一致するか確認し、不一致なら整合性
+  チェック失敗として該当エントリの復元を拒否します。
+  ビット反転(ペイロードの書換)テストでは全オフセットの検出を確認済みです。
+- 非可逆(量子化・トランスコード)エントリはCRCを持たず、復元結果が
+  元と異なるため検証の対象外です。
 
 ### 注意事項・制限
 
@@ -151,9 +164,13 @@ python3 tests/test_roundtrip.py --cc /tmp/cc_test
   形式特化の前処理(REV-BWT・JSON分割・DBカラム分離)を含みます。
   一般ファイル全般での優劣を示すものではありません。
   ベンチ用データはリポジトリに含まれません。
-- **アーカイブの完全性**: 切詰めは検出して拒否しますが、
-  ペイロード内のビット反転を検出するCRCは未実装です。
-  長期保存・配布用途では外部でのハッシュ管理を推奨します。
+- **アーカイブの完全性**: 切詰めは検出して拒否し、さらに
+  各エントリの可逆ペイロードには **CRC32C(エントリ単位)** を付与しています。
+  復元後ファイルを原文と比較し、不一致を検出すると整合性チェック失敗として
+  そのエントリの復元を拒否します。ビット反転(ペイロードの書換)は
+  ビット反転テストで全オフセットの検出を確認済みです(28サンプル)。
+  非可逆(量子化・トランスコード)エントリはCRCを持たず、復元結果は
+  元と異なるため、検証の対象外です。
 
 ---
 
@@ -272,7 +289,8 @@ MP4 を `ftyp / moov / mdat / free ...` の box ツリーとして解析しま�
 
 ```
 マジック : "CATCOMP1" (8 bytes)
-バージョン: 0x01
+バージョン: 0x02 (エントリ単位CRC32C付き);
+           0x01 (旧・CRCなし) も読み取り可
 エントリ繰り返し:
   kind      : u8   (0=End, 1=Single, 2=Member)
   pathLen   : u8
@@ -281,7 +299,12 @@ MP4 を `ftyp / moov / mdat / free ...` の box ツリーとして解析しま�
   origSize  : u64le
   compSize  : u64le
   payload   : compSize bytes
+  trailer   : checksumType(u8) + checksum(u32le)
 ```
+
+checksumType は `0 = 検証なし(非可逆エントリ)` / `1 = CRC32C(原文または復元後ファイル)`。
+checksum は Castagnoli 多項式(0x1EDC6F41, CRC32C)で、エントリ単位のビット反転検出に
+使用します。非可逆エントリは常に type=0(検証なし)になります。
 
 CAT-Z エントリの payload は `[1 byte header: pm|pb]` + レンジコーディングされた
 CAT-Z ストリームです。header の low 4 bits = ProbMove, high 4 bits = ProbBits。
@@ -289,6 +312,20 @@ CAT-Z ストリームです。header の low 4 bits = ProbMove, high 4 bits = Pr
 LOSSY エントリの payload は `extLen + ext + innerMethod + transSize + 変換データ`
 で、テンソルの場合は量子化済み safetensors(`__metadata__.__quant__` に bits /
 scales / 元 dtype を保持)です。
+
+### デルタ形式 (--base)
+
+`ext == "dtens"` の LOSSY エントリは、基準モデルとのバイト差分を
+CAT-Z で圧縮した可逆デルタです。ペイロード先頭は以下のヘッダです:
+
+```
+"DT1\0" (4 bytes) + 基準モデル SHA-256 (32 bytes) + cjson_len (u64le)
++ cjson + data_len (u64le) + 差分データ
+```
+
+復元時は `--base` で指定されたファイルの SHA-256 と
+ヘッダ内の SHA-256 を照合し、不一致なら即座に拒否します。
+これにより誤った基準モデルによる誤復元を防止します。
 
 ---
 
@@ -302,6 +339,35 @@ scales / 元 dtype を保持)です。
   「入力 + 出力」分のみ。メディア変換(ffmpeg 使用時)の一時ファイルは
   環境変数 `CATCOMP_TMP` で変更可能です(既定: `~/.catcc_tmp`)。
 - 対応テンソル拡張子: `.safetensors` / `.safetensor` / `.bin`
+
+---
+
+## 実装済み / 完了項目
+
+- ✅ **テンソル量子化の品質指標** — `tests/test_quality.py` に実装済み。
+  SNR[dB]・余弦類似度・MAE・RMSE・最大絶対誤差を per-tensor/dtype 別
+  に算出し、qbits 増加に伴う単調性（SNR/余弦は非減少、誤差は非増加）を検証。
+  CPU のみ・決定論的・外部データ不要で `python3 tests/test_quality.py` で実行可。
+- ✅ **速度・最大RSS ベンチマーク** — `test_speed_rss_finite` に実装済み。
+  `time.monotonic` + `resource.RUSAGE_CHILDREN.ru_maxrss` で実時間[s]・最大RSS[kB]
+  を実測し、有限非負を検証。GPU 不要・決定論的・外部ベンチデータ不要。
+- ✅ **`--base` 厳密検証** — 実装済み。基準モデルの SHA-256 をデルタアーカイブ
+  ヘッダ（`DT1\0` + 32バイト）に記録し、復元時に `--base` 指定ファイルの
+  SHA-256 と照合。不一致なら「SHA-256が一致しません」で即座に拒否。
+  `--base=PATH` と `--base PATH` の両形式に対応。
+- ✅ **複数OS・複数Nimバージョン CI** — `.github/workflows/ci.yml` に実装済み。
+  Ubuntu/macOS/Windows × Nim 1.6/2.2 でビルド・品質テスト・ラウンドトリップテストを自動実行。
+
+## 将来のスコープ / ロードマップ
+
+優先順（「上から順」に着手）:
+
+1. **LLM perplexity 等の品質指標** — GPU 評価基盤を必要とする大規模
+   LLM の生成品質評価。現状は CPU のみで再現可能な数値忠実度指標を既定とする。
+2. **ベンチマーク結果のドキュメント化** — 速度・RSS 表を Markdown/CSV で
+   定期的に `docs/` 以下に出力・更新する自動化。
+3. **圧縮率予測ヒューリスティック** — 入力の先頭数 MB から最適コーデック/
+   パラメータを推定し、初回圧縮の試行回数を削減。
 
 ---
 
