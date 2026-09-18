@@ -39,7 +39,6 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           choco install nim --version=${{ matrix.nim }} -y
-          $env:PATH = "C:\tools\Nim\nim-${{ matrix.nim }}\bin;${env:USERPROFILE}\.nimble\bin;$env:PATH"
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -54,11 +53,19 @@ jobs:
 
       - name: Build (release)
         run: |
-          nim c -d:release -o:src/CatelliteCompressor src/CatelliteCompressor.nim
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            "C:/tools/Nim/nim-${{ matrix.nim }}/bin/nim.exe" c -d:release -o:src/CatelliteCompressor.exe src/CatelliteCompressor.nim
+          else
+            nim c -d:release -o:src/CatelliteCompressor src/CatelliteCompressor.nim
+          fi
 
       - name: Run quality tests
         run: |
-          python3 tests/test_quality.py --cc src/CatelliteCompressor
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python3 tests/test_quality.py --cc src/CatelliteCompressor.exe
+          else
+            python3 tests/test_quality.py --cc src/CatelliteCompressor
+          fi
 
       - name: Run roundtrip tests
         if: runner.os != 'Windows'
@@ -74,5 +81,10 @@ jobs:
 
       - name: Verify binary runs
         run: |
-          src/CatelliteCompressor c --help 2>&1 | head -1
-          src/CatelliteCompressor d --help 2>&1 | head -1
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            src/CatelliteCompressor.exe c --help 2>&1 | head -1
+            src/CatelliteCompressor.exe d --help 2>&1 | head -1
+          else
+            src/CatelliteCompressor c --help 2>&1 | head -1
+            src/CatelliteCompressor d --help 2>&1 | head -1
+          fi
