@@ -51,40 +51,46 @@ jobs:
         run: |
           brew install python3 git
 
-      - name: Build (release)
+      - name: Build (release) - Linux/macOS
+        if: runner.os != 'Windows'
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            "C:/tools/Nim/nim-${{ matrix.nim }}/bin/nim.exe" c -d:release -o:src/CatelliteCompressor.exe src/CatelliteCompressor.nim
-          else
-            nim c -d:release -o:src/CatelliteCompressor src/CatelliteCompressor.nim
-          fi
+          nim c -d:release -o:src/CatelliteCompressor src/CatelliteCompressor.nim
 
-      - name: Run quality tests
+      - name: Build (release) - Windows
+        if: runner.os == 'Windows'
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            python3 tests/test_quality.py --cc src/CatelliteCompressor.exe
-          else
-            python3 tests/test_quality.py --cc src/CatelliteCompressor
-          fi
+          C:/tools/Nim/nim-${{ matrix.nim }}/bin/nim.exe c -d:release -o:src/CatelliteCompressor.exe src/CatelliteCompressor.nim
 
-      - name: Run roundtrip tests
+      - name: Run quality tests - Linux/macOS
+        if: runner.os != 'Windows'
+        run: |
+          python3 tests/test_quality.py --cc src/CatelliteCompressor
+
+      - name: Run quality tests - Windows
+        if: runner.os == 'Windows'
+        run: |
+          python3 tests/test_quality.py --cc src/CatelliteCompressor.exe
+
+      - name: Run roundtrip tests - Linux/macOS
         if: runner.os != 'Windows'
         timeout-minutes: 15
         run: |
           python3 tests/test_roundtrip.py --cc src/CatelliteCompressor
 
-      - name: Run roundtrip tests (Windows)
+      - name: Run roundtrip tests - Windows
         if: runner.os == 'Windows'
         timeout-minutes: 15
         run: |
           python3 tests/test_roundtrip.py --cc src/CatelliteCompressor.exe
 
-      - name: Verify binary runs
+      - name: Verify binary runs - Linux/macOS
+        if: runner.os != 'Windows'
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            src/CatelliteCompressor.exe c --help 2>&1 | head -1
-            src/CatelliteCompressor.exe d --help 2>&1 | head -1
-          else
-            src/CatelliteCompressor c --help 2>&1 | head -1
-            src/CatelliteCompressor d --help 2>&1 | head -1
-          fi
+          src/CatelliteCompressor c --help 2>&1 | head -1
+          src/CatelliteCompressor d --help 2>&1 | head -1
+
+      - name: Verify binary runs - Windows
+        if: runner.os == 'Windows'
+        run: |
+          src/CatelliteCompressor.exe c --help 2>&1 | head -1
+          src/CatelliteCompressor.exe d --help 2>&1 | head -1
