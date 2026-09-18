@@ -2641,6 +2641,7 @@ proc writeDequant(outp: Stream, val: float32, od: string) =
 # 成功時は (lossy ペイロード compSize, 採用 bits)、不適時は (0, 0) を返します。
 proc packTensorQuant(outp: Stream, kind: uint8, relPath: string,
                      srcPath: string, origF: uint64, qbits: int): tuple[compL: uint64, bits: int] =
+  if origF < 16: return (0.uint64, 0)  # safetensorsヘッダ(8B長+JSON)に満たない場合は対象外
   var f = openFileStream(srcPath, fmRead)
   if f.atEnd(): f.close(); return (0.uint64, 0)
   let rawHlen = f.rU64le()
