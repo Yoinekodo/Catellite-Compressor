@@ -87,14 +87,14 @@ const LzWindow = 65535
 const MinMatch = 4  # old LZ constant (CAT-Z overrides to 8)
 const LazyThresh = 2
 const MaxMatchLen = 255
-const ChunkSize = 1 shl 20
+const ChunkSize = 1 shl 18
 const SampleSize = 1 shl 18
 const RawThreshold = 0.97
 const HashBits = 18
 const HashSize = 1 shl HashBits
 const HashBits2 = 15
 const HashSize2 = 1 shl HashBits2
-const HashBitsZ = 21
+const HashBitsZ = 16
 const HashSizeZ = 1 shl HashBitsZ
 const HashBits2Z = 16
 const HashSize2Z = 1 shl HashBits2Z
@@ -721,8 +721,8 @@ const Z_LC_MASK = (1 shl Z_LC) - 1  # 0x7 for lc=3
 
 const MinMatchZ = 4                        # CAT-Z最小一致長
 const ZMaxNb = 26                          # 最大オフセットビット(64MB辞書に必要)
-const ZKeepBytes = 4 * 1024 * 1024
-const ZMaxOff = 64 * 1024 * 1024           # 64MB dictionary (xz -9デフォルト)
+const ZKeepBytes = 256 * 1024
+const ZMaxOff = 256 * 1024           # 256KB dictionary (メモリ節約 + デコーダ履歴に収まる)
 const MaxChain = 2048                      # bt4 最大探索深さ (大幅拡大)
 const NiceLen = 273                        # LZMA互換: これ以上のマッチは即採用
 const FastBytes = 64                       # LZMA互換: この長さ以上なら探索打ち切り
@@ -857,14 +857,15 @@ proc rcTreeDec(d: var RcDec, probs: var openArray[Prob], base: int, bits: int): 
 
 proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int, obSize: int, usePriced: bool, useGreedy: bool = false, maxChainOverride: int = -1, useLzmaLitCtx: bool = true): uint64 =
   let MaxChainEff = if maxChainOverride >= 0: maxChainOverride else: MaxChain
+  # メモリ節約: ハッシュテーブルとチェーン配列のサイズを削減
   var head = newSeq[int](HashSizeZ)
-  for i in 0..<HashSizeZ: head[i] = -1
+  for i in 0..<head.len: head[i] = -1
   var head2 = newSeq[int](HashSize2Z)
-  for i in 0..<HashSize2Z: head2[i] = -1
-  var chain = newSeq[int](ChunkSize * 2)
+  for i in 0..<head2.len: head2[i] = -1
+  var chain = newSeq[int](ChunkSize)
   for i in 0..<chain.len: chain[i] = -1
-  var btLeft = newSeq[int](ChunkSize * 2)
-  var btRight = newSeq[int](ChunkSize * 2)
+  var btLeft = newSeq[int](ChunkSize)
+  var btRight = newSeq[int](ChunkSize)
   for i in 0..<btLeft.len:
     btLeft[i] = -1
     btRight[i] = -1
@@ -989,6 +990,10 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
 
   proc refill() =
     if eof: return
+    # メモリ節約: idxが追いついていない場合は読み込みを抑制
+    if buf.len > ZKeepBytes + 4 * 1024 * 1024 and idx < buf.len - ZKeepBytes:
+      # idxが遅れている: これ以上読み込まない(処理が追いつくまで待つ)
+      return
     let want: int = int(min(uint64(ChunkSize), inputLimit - readTotal))
     if want == 0:
       eof = true
@@ -1009,15 +1014,28 @@ proc catZEncodeCore(src, dst: Stream, inputLimit: uint64, pmove: int, pbits: int
     readTotal += uint64(got)
     if readTotal >= inputLimit or got < want:
       eof = true
-    if buf.len > ZKeepBytes + 8 * ChunkSize:
+    if buf.len > ZKeepBytes + 2 * ChunkSize:
       let cut = idx - ZKeepBytes
       if cut > 0:
         buf.delete(0 .. cut - 1)
         base += cut
         dec(idx, cut)
-        btLeft = btLeft[cut .. ^1]
-        btRight = btRight[cut .. ^1]
-        chain = chain[cut .. ^1]
+        # Use setLen + copyMem instead of slicing to avoid keeping old memory
+        let newLen = btLeft.len - cut
+        if newLen > 0:
+          # Shift data left
+          for i in 0..<newLen:
+            btLeft[i] = btLeft[i + cut]
+            btRight[i] = btRight[i + cut]
+            chain[i] = chain[i + cut]
+          btLeft.setLen(newLen)
+          btRight.setLen(newLen)
+          chain.setLen(newLen)
+        else:
+          btLeft.setLen(0)
+          btRight.setLen(0)
+          chain.setLen(0)
+        GC_fullCollect()
 
   refill()
   if useGreedy:
@@ -3807,32 +3825,41 @@ proc packEntry(outp: Stream, kind: uint8, relPath, srcPath, dispName: string,
       var bestMth = MethodRaw
       var bestSize = int64(origF)
 
-      block tryVm:
-        var ft = openFileStream(srcPath, fmRead)
-        var tOut = newStringStream("")
-        discard vmEncode(ft, tOut, uint64(origF))
-        let s = int64(tOut.getPosition())
-        if s > 0 and s < bestSize:
-          bestSize = s; bestMth = MethodVm
-        ft.close()
+      if origF <= 10 * 1024 * 1024:
+        # 通常サイズ(<=10MB): 全コーデックを試して最小を採用
+        block tryVm:
+          var ft = openFileStream(srcPath, fmRead)
+          var tOut = newStringStream("")
+          discard vmEncode(ft, tOut, uint64(origF))
+          let s = int64(tOut.getPosition())
+          if s > 0 and s < bestSize:
+            bestSize = s; bestMth = MethodVm
+          ft.close()
+          tOut = nil
 
-      block tryLz:
-        var ft = openFileStream(srcPath, fmRead)
-        var tOut = newStringStream("")
-        discard lzEncode(ft, tOut, uint64(origF))
-        let s = int64(tOut.getPosition())
-        if s > 0 and s < bestSize:
-          bestSize = s; bestMth = MethodCatLz
-        ft.close()
+        block tryLz:
+          var ft = openFileStream(srcPath, fmRead)
+          var tOut = newStringStream("")
+          discard lzEncode(ft, tOut, uint64(origF))
+          let s = int64(tOut.getPosition())
+          if s > 0 and s < bestSize:
+            bestSize = s; bestMth = MethodCatLz
+          ft.close()
+          tOut = nil
 
-      block tryZ:
-        var ft = openFileStream(srcPath, fmRead)
-        var tOut = newStringStream("")
-        discard catZEncode(ft, tOut, uint64(origF))
-        let s = int64(tOut.getPosition())
-        if s > 0 and s < bestSize:
-          bestSize = s; bestMth = MethodCatZ
-        ft.close()
+        block tryZ:
+          var ft = openFileStream(srcPath, fmRead)
+          var tOut = newStringStream("")
+          discard catZEncode(ft, tOut, uint64(origF))
+          let s = int64(tOut.getPosition())
+          if s > 0 and s < bestSize:
+            bestSize = s; bestMth = MethodCatZ
+          ft.close()
+          tOut = nil
+      else:
+        # 大容量ファイル(>10MB): メモリ節約のためCAT-Zを直接使用
+        bestMth = MethodCatZ
+        echo "[", dispName, "] 大容量ファイルのためCAT-Zを直接使用 (", origF, " bytes)"
 
 # JSON専用: 大きなファイル向けにskeleton/keys/strs分離 + BWT + 個別圧縮
       if srcPath.toLowerAscii.endsWith(".json") and origF > 1024 * 1024:
